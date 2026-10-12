@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+contract ApexSyntheticPerpetualVault {
+    enum PositionState { Active, Settled }
+
+    struct PerpetualPosition {
+        address payable trader;
+        uint256 marginETH;
+        uint256 leverageFactor;
+        uint256 entryTimestamp;
+        PositionState state;
+        bytes32 pairKey;
+    }
+
+    address payable public immutable vaultGovernor;
+    string public protocolDescriptor;
+    uint256 public fundingRateBps; // 150 = 1.5%
+    uint256 public positionCounter;
+    uint256 public totalLockedMargin;
+    uint256 public fundingFeePool;
+    bool public isProtocolPaused;
+
+    mapping(bytes32 => bool) public activePairs;
+    mapping(uint256 => PerpetualPosition) public positions;
+
+    event PairAdded(bytes32 indexed pairKey);
+    event PairRemoved(bytes32 indexed pairKey);
+    event FundingRateAdjusted(uint256 newRateBps);
+    event PositionSettled(uint256 indexed positionId, uint256 payoutAmount);
+    event FundingFeesCollected(address indexed governor, uint256 amount);
+    event ReserveLiquiditySupplied(address indexed funder, uint256 amount);
+    event ReservesDrained(address indexed governor, uint256 amount);
+    event SyntheticTradeExecuted(address indexed trader, uint256 inputETH, uint256 netSettled);
+    event MarginIncreased(uint256 indexed positionId, uint256 addedAmount);
+    event PositionOpened(uint256 indexed positionId, address indexed trader, uint256 margin);
+    event LeverageRebalanced(uint256 indexed positionId, uint256 newLeverage);
+    event PauseStateToggled(bool isPaused);
+    event PositionOwnershipTransferred(uint256 indexed positionId, address indexed oldOwner, address indexed newOwner);
+    event DescriptorUpdated(string newDescriptor);
+    event ExcessMarginWithdrawn(uint256 indexed positionId, uint256 amount);
+
+    modifier onlyGovernor() {
+        require(msg.sender == vaultGovernor, "SynthPerp: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isProtocolPaused, "SynthPerp: Protocol paused");
+        _;
+    }
+
+    constructor() {
+        vaultGovernor = payable(msg.sender);
+        protocolDescriptor = "Apex Base Synthetic Perpetual Vault Core v1";
+        fundingRateBps = 150; // 1.5%
+        isProtocolPaused = false;
+        activePairs[0x424153455f504552505f4554485f555344430000000000000000000000000000] = true;
+    }
+
+    // 1. addSupportedSyntheticPair
+    function addSupportedSyntheticPair(bytes32 pairKey) external onlyGovernor {
+        require(!activePairs[pairKey], "SynthPerp: Pair already exists");
+        activePairs[pairKey] = true;
+        emit PairAdded(pairKey);
+    }
+
+    // 2. adjustFundingRateBps
+    function adjustFundingRateBps(uint256 newRateBps) external onlyGovernor {
+        require(newRateBps <= 1000, "SynthPerp: Rate cap 10%");
+        fundingRateBps = newRateBps;
+        emit FundingRateAdjusted(newRateBps);
+    }
+
+    // 3. closeSyntheticPosition
+    function closeSyntheticPosition(uint256 positionId) external {
+        PerpetualPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "SynthPerp: Invalid ID");
+        require(p.trader == msg.sender || msg.sender == vaultGovernor, "SynthPerp: Unauthorized");
+        require(p.state == PositionState.Active, "SynthPerp: Already settled");
+
+        p.state = PositionState.Settled;
+        uint256 refund = p.marginETH;
+        p.marginETH = 0;
+        totalLockedMargin -= refund;
+
+        if (refund > 0) {
+            (bool sent, ) = p.trader.call{value: refund}("");
+            require(sent, "SynthPerp: Settlement failed");
+        }
+
+        emit PositionSettled(positionId, refund);
+    }
+
+    // 4. collectFundingFeePool
+    function collectFundingFeePool() external onlyGovernor {
+        uint256 amount = fundingFeePool;
+        require(amount > 0, "SynthPerp: Zero funding fees");
+
+        fundingFeePool = 0;
+        (bool sent, ) = vaultGovernor.call{value: amount}("");
+        require(sent, "SynthPerp: Fee transfer failed");
+
+        emit FundingFeesCollected(vaultGovernor, amount);
+    }
+
+    // 5. depositReserveLiquidity
+    function depositReserveLiquidity() external payable whenNotPaused {
+        require(msg.value > 0, "SynthPerp: Zero deposit");
+        fundingFeePool += msg.value;
+        emit ReserveLiquiditySupplied(msg.sender, msg.value);
+    }
+
+    // 6. drainRemainingReserves
+    function drainRemainingReserves() external onlyGovernor {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "SynthPerp: Zero balance");
+
+        totalLockedMargin = 0;
+        fundingFeePool = 0;
+
+        (bool sent, ) = vaultGovernor.call{value: balance}("");
+        require(sent, "SynthPerp: Drain failed");
+
+        emit ReservesDrained(vaultGovernor, balance);
+    }
+
+    // 7. executeSyntheticTradeLeg
+    function executeSyntheticTradeLeg() external payable whenNotPaused {
+        require(msg.value > 0, "SynthPerp: Zero trade amount");
+
+        uint256 fee = (msg.value * fundingRateBps) / 10000;
+        uint256 netSettled = msg.value - fee;
+        fundingFeePool += fee;
+
+        (bool sent, ) = payable(msg.sender).call{value: netSettled}("");
+        require(sent, "SynthPerp: Trade return failed");
+
+        emit SyntheticTradeExecuted(msg.sender, msg.value, netSettled);
+    }
+
+    // 8. increasePositionMargin
+    function increasePositionMargin(uint256 positionId) external payable whenNotPaused {
+        PerpetualPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "SynthPerp: Invalid ID");
+        require(p.state == PositionState.Active, "SynthPerp: Position closed");
+        require(msg.value > 0, "SynthPerp: Zero margin top-up");
+
+        p.marginETH += msg.value;
+        totalLockedMargin += msg.value;
+
+        emit MarginIncreased(positionId, msg.value);
+    }
+
+    // 9. openSyntheticPosition
+    function openSyntheticPosition(bytes32 pairKey, uint256 leverage) external payable whenNotPaused returns (uint256) {
+        require(activePairs[pairKey], "SynthPerp: Unsupported pair");
+        require(msg.value > 0, "SynthPerp: Margin required");
+        require(leverage >= 1 && leverage <= 50, "SynthPerp: Invalid leverage factor");
+
+        positionCounter++;
+        positions[positionCounter] = PerpetualPosition({
+            trader: payable(msg.sender),
+            marginETH: msg.value,
+            leverageFactor: leverage,
+            entryTimestamp: block.timestamp,
+            state: PositionState.Active,
+            pairKey: pairKey
+        });
+
+        totalLockedMargin += msg.value;
+        emit PositionOpened(positionCounter, msg.sender, msg.value);
+        return positionCounter;
+    }
+
+    // 10. rebalancePositionLeverage
+    function rebalancePositionLeverage(uint256 positionId, uint256 newLeverage) external whenNotPaused {
+        PerpetualPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "SynthPerp: Invalid ID");
+        require(p.trader == msg.sender || msg.sender == vaultGovernor, "SynthPerp: Unauthorized");
+        require(p.state == PositionState.Active, "SynthPerp: Not active");
+        require(newLeverage >= 1 && newLeverage <= 50, "SynthPerp: Invalid leverage");
+
+        p.leverageFactor = newLeverage;
+        emit LeverageRebalanced(positionId, newLeverage);
+    }
+
+    // 11. renouncePairSupport
+    function renouncePairSupport(bytes32 pairKey) external onlyGovernor {
+        require(activePairs[pairKey], "SynthPerp: Pair not found");
+        activePairs[pairKey] = false;
+        emit PairRemoved(pairKey);
+    }
+
+    // 12. toggleProtocolPause
+    function toggleProtocolPause(bool isPaused) external onlyGovernor {
+        isProtocolPaused = isPaused;
+        emit PauseStateToggled(isPaused);
+    }
+
+    // 13. transferPositionOwnership
+    function transferPositionOwnership(uint256 positionId, address payable newOwner) external {
+        PerpetualPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "SynthPerp: Invalid ID");
+        require(p.trader == msg.sender || msg.sender == vaultGovernor, "SynthPerp: Unauthorized");
+        require(newOwner != address(0), "SynthPerp: Zero address");
+
+        address oldOwner = p.trader;
+        p.trader = newOwner;
+
+        emit PositionOwnershipTransferred(positionId, oldOwner, newOwner);
+    }
+
+    // 14. updateProtocolDescriptor
+    function updateProtocolDescriptor(string calldata newDescriptor) external onlyGovernor {
+        require(bytes(newDescriptor).length > 0, "SynthPerp: Empty string");
+        protocolDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // 15. withdrawExcessMargin
+    function withdrawExcessMargin(uint256 positionId, uint256 amount) external {
+        PerpetualPosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "SynthPerp: Invalid ID");
+        require(p.trader == msg.sender || msg.sender == vaultGovernor, "SynthPerp: Unauthorized");
+        require(p.state == PositionState.Active, "SynthPerp: Not active");
+        require(p.marginETH >= amount && amount > 0, "SynthPerp: Insufficient margin");
+
+        p.marginETH -= amount;
+        totalLockedMargin -= amount;
+
+        (bool sent, ) = p.trader.call{value: amount}("");
+        require(sent, "SynthPerp: Withdrawal failed");
+
+        emit ExcessMarginWithdrawn(positionId, amount);
+    }
+
+    // Read-метод
+    function getPositionDetails(uint256 positionId) external view returns (
+        address trader,
+        uint256 marginETH,
+        uint256 leverageFactor,
+        uint256 entryTimestamp,
+        PositionState state,
+        bytes32 pairKey
+    ) {
+        PerpetualPosition memory p = positions[positionId];
+        return (p.trader, p.marginETH, p.leverageFactor, p.entryTimestamp, p.state, p.pairKey);
+    }
+}
